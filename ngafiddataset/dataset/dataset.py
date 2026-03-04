@@ -23,7 +23,7 @@ class NGAFID_Dataset_Downloader:
     ngafid_urls = {
         "all_flights": "https://drive.google.com/uc?id=1-0pVPhwRQoifT_VuQyGDLXuzYPYySX-Y",
         # "2days": "https://drive.google.com/uc?id=1-2pxwiQNhFnhTg7whosQoF_yztD5jOM2",
-        "2days": "https://drive.google.com/file/d/1KIQKQOu9oMed_RMxtwn3Zpc2nC21viT_/view?usp=share_link",
+        "2days": "https://drive.google.com/file/d/1KIQKQOu9oMed_RMxtwn3Zpc2nC21viT_",
     }
 
     @classmethod
