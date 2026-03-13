@@ -1,4 +1,3 @@
-
 import gdown
 import pandas as pd
 import numpy as np
@@ -16,6 +15,33 @@ from compress_pickle import load
 from ngafiddataset.dataset.utils import *
 
 
+def linear_interpolate_nan(arr: np.ndarray) -> np.ndarray:
+    arr = arr.copy()
+    arr = arr.astype(np.float32)
+
+    T, C = arr.shape
+
+    for c in range(C):
+        channel = arr[:, c]
+        nan_mask = np.isnan(channel)
+
+        if not nan_mask.any():
+            continue
+
+        valid_idx = np.where(~nan_mask)[0]
+
+        if len(valid_idx) == 0:
+            arr[:, c] = 0.0
+            continue
+
+        arr[:, c] = np.interp(
+            np.arange(T),
+            valid_idx,
+            channel[valid_idx]
+        )
+
+    return arr
+
 
 class NGAFID_Dataset_Downloader:
 
@@ -27,12 +53,12 @@ class NGAFID_Dataset_Downloader:
     }
 
     @classmethod
-    def download(cls, name : str, destination:str = '', extract = True):
+    def download(cls, name: str, destination: str = '', extract=True):
 
         assert name in cls.ngafid_urls.keys()
 
         url = cls.ngafid_urls[name]
-        output =  os.path.join(destination, "%s.tar.gz" % name)
+        output = os.path.join(destination, "%s.tar.gz" % name)
 
         if not os.path.exists(output):
             gdown.download(url, output, quiet=False)
@@ -48,81 +74,189 @@ class NGAFID_Dataset_Manager(NGAFID_Dataset_Downloader):
 
     channels = 23
 
-    def __init__(self, name: str, destination:str = '',  max_length = 4096, extract = True, **kwargs):
+    def __init__(
+        self,
+        name: str,
+        destination: str = '',
+        max_length=4096,
+        extract=True,
+        nan_fill_method='none',
+        use_sliding_window=False,
+        window_stride=2048,
+        **kwargs
+    ):
         assert name in self.ngafid_urls.keys()
 
         if name == 'all_flights':
-            logger.info('Downloading and extracting Parquet Files to %s\one_parq.  Please open them using dask dataframes' % destination)
-
-            self.download(name, destination, extract = True)
+            logger.info(
+                'Downloading and extracting Parquet Files to %s\\one_parq. Please open them using dask dataframes'
+                % destination
+            )
+            self.download(name, destination, extract=True)
 
         else:
-
             self.name = name
             self.max_length = max_length
             self.destination = destination
 
+
+            self.nan_fill_method = nan_fill_method
+            self.use_sliding_window = use_sliding_window
+            self.window_stride = window_stride
+
             self.files = ['flight_data.pkl', 'flight_header.csv', 'stats.csv']
-            self.files = {file : os.path.join(destination, name, file) for file in self.files}
+            self.files = {file: os.path.join(destination, name, file) for file in self.files}
 
-            self.download(name, destination, extract)
+            # self.download(name, destination, extract)
 
-            self.flight_header_df = pd.read_csv(self.files['flight_header.csv'],  index_col='Master Index')
+            self.flight_header_df = pd.read_csv(self.files['flight_header.csv'], index_col='Master Index')
             self.flight_data_array = load(self.files['flight_data.pkl'])
             self.flight_stats_df = pd.read_csv(self.files['stats.csv'])
 
-
-
             # self.data_dict = self.construct_data_dictionary()
 
-            self.maxs = self.flight_stats_df.iloc[0, 1:24].to_numpy(dtype = np.float32)
-            self.mins = self.flight_stats_df.iloc[1, 1:24].to_numpy(dtype = np.float32)
+            self.maxs = self.flight_stats_df.iloc[0, 1:24].to_numpy(dtype=np.float32)
+            self.mins = self.flight_stats_df.iloc[1, 1:24].to_numpy(dtype=np.float32)
 
-    def update_flight_header(self):
-        '''
-        Adds some things we forgot
-        '''
-
-        self.flight_header_df['number_flights_before'] = self.light_header_df.filename.apply(
-            lambda x: x.split('_')[-2])
-
-    def construct_data_dictionary(self, numpy = True):
+    def construct_data_dictionary(
+        self,
+        numpy=True,
+        stride=None,
+        nan_fill_method=None,
+        use_sliding_window=None
+    ):
         data_dict = []
 
-        for index, row in tqdm(self.flight_header_df.iterrows(), total = len(self.flight_header_df)):
+        if stride is None:
+            stride = self.window_stride
+        if nan_fill_method is None:
+            nan_fill_method = self.nan_fill_method
+        if use_sliding_window is None:
+            use_sliding_window = self.use_sliding_window
 
-            # pad array
-            arr = np.zeros((self.max_length, self.channels), dtype = np.float16)
-            to_pad = self.flight_data_array[index][-self.max_length:, :]
-            arr[:to_pad.shape[0], :] += to_pad
+        for index, row in tqdm(self.flight_header_df.iterrows(), total=len(self.flight_header_df)):
 
-            if numpy:
+            window_id = 0
+            flight = self.flight_data_array[index]
+
+            # =========================================================
+            # Optional NaN fill
+            #   - 'linear' / True : Linear Interpolation
+            #   - 'none' / None / False : replace_nan_w_zero
+            # =========================================================
+            if nan_fill_method in ['linear', True]:
+                flight = linear_interpolate_nan(flight)
+            elif nan_fill_method in ['none', None, False]:
                 pass
             else:
-                arr = tf.convert_to_tensor(arr, dtype = tf.bfloat16)
+                raise ValueError(f"Unsupported nan_fill_method: {nan_fill_method}")
 
-            data_dict.append({'id': index,
-                              'data': arr,
-                              'class': row['class'],
-                              'fold': row['fold'],
-                              'target_class': row['target_class'],
-                              'before_after': row['before_after'],
-                              'hclass': row['hclass']})
+            T = flight.shape[0]
+
+            # =========================================================
+            # no sliding window -> truncate to last max_length and zero-pad
+            # =========================================================
+            if not use_sliding_window:
+
+                arr = np.zeros((self.max_length, self.channels), dtype=np.float16)
+
+                to_pad = flight[-self.max_length:, :]
+
+                arr[:to_pad.shape[0], :] += to_pad
+
+                if not numpy:
+                    arr = tf.convert_to_tensor(arr, dtype=tf.bfloat16)
+
+                data_dict.append({
+                    'id': index,
+                    'window_id': window_id,
+                    'data': arr,
+                    'class': row['class'],
+                    'fold': row['fold'],
+                    'target_class': row['target_class'],
+                    'before_after': row['before_after'],
+                    'hclass': row['hclass']
+                })
+
+            # =========================================================
+            # Sliding window
+            # =========================================================
+            else:
+
+                if T <= self.max_length:
+
+                    arr = np.zeros((self.max_length, self.channels), dtype=np.float16)
+                    arr[:T, :] = flight
+
+                    if not numpy:
+                        arr = tf.convert_to_tensor(arr, dtype=tf.bfloat16)
+
+                    data_dict.append({
+                        'id': index,
+                        'window_id': window_id,
+                        'data': arr,
+                        'class': row['class'],
+                        'fold': row['fold'],
+                        'target_class': row['target_class'],
+                        'before_after': row['before_after'],
+                        'hclass': row['hclass']
+                    })
+
+                else:
+
+                    starts = list(range(0, T - self.max_length + 1, stride))
+
+                    if starts[-1] != T - self.max_length:
+                        starts.append(T - self.max_length)
+
+                    for start in starts:
+
+                        window = flight[start:start + self.max_length]
+                        arr = window.astype(np.float16)
+
+                        if not numpy:
+                            arr = tf.convert_to_tensor(arr, dtype=tf.bfloat16)
+
+                        data_dict.append({
+                            'id': index,
+                            'window_id': window_id,
+                            'data': arr,
+                            'class': row['class'],
+                            'fold': row['fold'],
+                            'target_class': row['target_class'],
+                            'before_after': row['before_after'],
+                            'hclass': row['hclass']
+                        })
+
+                        window_id += 1
 
         return data_dict
 
-    def get_tf_dataset(self, fold = 0, training = False, shuffle = False, batch_size = 64, repeat = False,
-                        mode = 'before_after', ds = None):
-
+    def get_tf_dataset(
+        self,
+        fold=0,
+        training=False,
+        shuffle=False,
+        batch_size=64,
+        repeat=False,
+        mode='before_after',
+        ds=None
+    ):
         if ds is None:
-            ds = tf.data.Dataset.from_tensor_slices(to_dict_of_list(get_slice(self.data_dict, fold = fold, reverse = training)))
-
+            ds = tf.data.Dataset.from_tensor_slices(
+                to_dict_of_list(
+                    get_slice(self.data_dict, fold=fold, reverse=training)
+                )
+            )
 
         ds = ds.repeat() if repeat else ds
         ds = ds.shuffle(shuffle) if shuffle else ds
 
+        # min-max scaling
         ds = ds.map(get_dict_mod('data', get_scaler(self.maxs, self.mins)))
+
         ds = ds.map(get_dict_mod('data', replace_nan_w_zero))
+
         ds = ds.map(get_dict_mod('data', lambda x: tf.cast(x, tf.float32)))
 
         if mode == 'before_after':
@@ -131,17 +265,20 @@ class NGAFID_Dataset_Manager(NGAFID_Dataset_Downloader):
             ds = ds.map(lambda x: (x['data'], x['target_class']))
         elif mode == 'both':
             ds = ds.map(lambda x: (
-            {'data': x['data']}, {'before_after': x['before_after'], 'target_class': x['target_class']}))
+                {'data': x['data']},
+                {'before_after': x['before_after'], 'target_class': x['target_class']}
+            ))
         elif mode == 'hierarchy_basic':
-            ds = ds.map(
-                lambda x: ({'data': x['data']}, {'before_after': x['before_after'], 'target_class': x['hclass']}))
+            ds = ds.map(lambda x: (
+                {'data': x['data']},
+                {'before_after': x['before_after'], 'target_class': x['hclass']}
+            ))
         else:
             raise KeyError
 
-        ds = ds.batch(batch_size, drop_remainder = True) if batch_size else ds
+        ds = ds.batch(batch_size, drop_remainder=True) if batch_size else ds
 
         return ds
 
-
-    def get_numpy_dataset(self, fold = 0, training = False):
-        return to_dict_of_list(get_slice(self.data_dict, fold = fold, reverse = training))
+    def get_numpy_dataset(self, fold=0, training=False):
+        return to_dict_of_list(get_slice(self.data_dict, fold=fold, reverse=training))
